@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stream TTS</title>
+<style>
+:root{color-scheme:dark;--bg:#10131a;--panel:#1b202b;--text:#f5f7fb;--muted:#aeb8ca;--accent:#9d8cff;--danger:#ff7777}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.45 system-ui,Arial,sans-serif}
+main{max-width:760px;margin:0 auto;padding:20px}h1{font-size:1.7rem;margin:0 0 6px}p{color:var(--muted)}.panel{background:var(--panel);border:1px solid #343b4a;border-radius:16px;padding:18px;margin:16px 0}
+label{display:block;font-weight:650;margin:12px 0 6px}input,textarea,select,button{font:inherit;border-radius:10px;border:1px solid #465064;padding:11px;background:#111620;color:var(--text);width:100%}textarea{min-height:100px;resize:vertical}button{background:var(--accent);color:#141020;font-weight:750;border:0;cursor:pointer;margin-top:10px}button.secondary{background:#303849;color:var(--text)}button.danger{background:var(--danger);color:#230909}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:130px}.hidden{display:none!important}.small{font-size:.88rem;color:var(--muted)}.status{padding:10px 12px;background:#111620;border-radius:10px;margin-top:10px;white-space:pre-wrap}.message{padding:12px;border-radius:10px;background:#111620;margin:8px 0;overflow-wrap:anywhere}.name{color:#c6baff;font-weight:800}.pill{display:inline-block;border:1px solid #465064;border-radius:99px;padding:3px 9px;font-size:.8rem;color:var(--muted)}.overlay{background:transparent;border:0;padding:0}.overlay body{background:transparent}
+</style>
+</head>
+<body>
+<main id="app">
+  <h1>Stream TTS</h1>
+  <p>A simple viewer message box that reads messages aloud in your browser. Uses the browser's built-in speech voice.</p>
+
+  <section class="panel" id="setup">
+    <label for="mode">Choose page</label>
+    <select id="mode"><option value="sender">Viewer / sender page</option><option value="receiver">Streamer / TTS receiver</option></select>
+    <label for="room">Room code</label>
+    <input id="room" maxlength="40" placeholder="Example: moon-fox-4821" autocomplete="off">
+    <p class="small">Use the same room code on both pages. The receiver page should stay private; share only the sender link and room code with viewers.</p>
+    <button id="connect">Connect</button>
+    <div id="setupStatus" class="status">Add your Firebase configuration to this file first. See README.md.</div>
+  </section>
+
+  <section class="panel hidden" id="senderPanel">
+    <div class="row"><div><span class="pill">VIEWER PAGE</span></div><div><button class="secondary" id="senderDisconnect">Disconnect</button></div></div>
+    <label for="displayName">Display name (optional)</label><input id="displayName" maxlength="24" placeholder="Viewer">
+    <label for="messageText">Message</label><textarea id="messageText" maxlength="280" placeholder="Type something for the stream to read aloud..." ></textarea>
+    <div class="row"><div class="small" id="charCount">0 / 280</div><div class="small">Please keep it stream-safe.</div></div>
+    <button id="send">Send message</button>
+    <div id="senderStatus" class="status" aria-live="polite">Connect to send.</div>
+  </section>
+
+  <section class="panel hidden" id="receiverPanel">
+    <div class="row"><div><span class="pill">STREAMER RECEIVER</span></div><div><button class="secondary" id="receiverDisconnect">Disconnect</button></div></div>
+    <p class="small">Keep this page open and share its browser tab/window in Lightstream. Press Enable voice once so the browser is allowed to speak.</p>
+    <div class="row">
+      <div><label for="voiceSelect">Voice</label><select id="voiceSelect"><option value="">Default browser voice</option></select></div>
+      <div><label for="rate">Speaking speed</label><input id="rate" type="range" min="0.7" max="1.3" step="0.05" value="1"></div>
+    </div>
+    <div class="row"><button id="enableVoice">Enable voice / test</button><button class="secondary" id="pauseSpeech">Pause speech</button><button class="secondary" id="resumeSpeech">Resume speech</button></div>
+    <div class="row"><button class="danger" id="clearQueue">Clear queue</button><button class="secondary" id="toggleMute">Mute TTS</button></div>
+    <label for="maxQueue">Maximum queued messages</label><select id="maxQueue"><option>3</option><option selected>5</option><option>10</option><option>20</option></select>
+    <div class="status" id="receiverStatus" aria-live="polite">Connect to listen for messages.</div>
+    <h3>Recent messages</h3><div id="messages"></div>
+  </section>
+  <p class="small">Safety note: this is a basic community tool, not a full moderation system. Keep the mute and clear-queue controls handy, and don't put private information in messages.</p>
+</main>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getDatabase, ref, push, onChildAdded, query, limitToLast, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+// Replace these placeholder values with the config from Firebase Console > Project settings > Your apps.
+const firebaseConfig = {
+  apiKey: "PASTE_API_KEY_HERE",
+  authDomain: "PASTE_PROJECT_ID_HERE.firebaseapp.com",
+  databaseURL: "PASTE_DATABASE_URL_HERE",
+  projectId: "PASTE_PROJECT_ID_HERE",
+  appId: "PASTE_APP_ID_HERE"
+};
+
+const $ = id => document.getElementById(id);
+let db, auth, roomRef, unsubscribe = null, currentMode = "sender", connected = false;
+let lastSendAt = 0, queue = [], speaking = false, muted = false, seenInitial = false;
+const clean = s => s.replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
+function status(id, msg){ $(id).textContent = msg; }
+function configReady(){ return !JSON.stringify(firebaseConfig).includes("PASTE_"); }
+function setPanels(mode){
+  $("setup").classList.add("hidden");
+  $("senderPanel").classList.toggle("hidden", mode !== "sender");
+  $("receiverPanel").classList.toggle("hidden", mode !== "receiver");
+}
+function disconnect(){
+  if(unsubscribe){ unsubscribe(); unsubscribe = null; }
+  connected = false; roomRef = null; queue = []; speaking = false;
+  if ("speechSynthesis" in window) speechSynthesis.cancel();
+  $("setup").classList.remove("hidden"); $("senderPanel").classList.add("hidden"); $("receiverPanel").classList.add("hidden");
+  status("setupStatus", "Disconnected.");
+}
+$("mode").addEventListener("change", e => { currentMode=e.target.value; });
+$("messageText").addEventListener("input", () => $("charCount").textContent = `${$("messageText").value.length} / 280`);
+$("connect").addEventListener("click", async () => {
+  const room = clean($("room").value);
+  if(!configReady()){ status("setupStatus","Firebase isn't configured yet. Follow README.md and paste your project's config into index.html."); return; }
+  if(room.length < 6){ status("setupStatus","Use a room code at least 6 characters long."); return; }
+  try {
+    status("setupStatus","Connecting…");
+    const app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    await signInAnonymously(auth);
+    db = getDatabase(app);
+    roomRef = ref(db, `rooms/${room}/messages`);
+    currentMode = $("mode").value;
+    connected = true; setPanels(currentMode);
+    if(currentMode === "sender"){
+      status("senderStatus", "Connected. Messages are limited to 280 characters and one every 5 seconds.");
+    } else {
+      queue=[]; $("messages").innerHTML=""; seenInitial=false;
+      const q = query(roomRef, limitToLast(30));
+      unsubscribe = onChildAdded(q, snap => {
+        const data=snap.val();
+        if(!data || !data.text || !data.createdAt) return;
+        // Ignore messages already present when the receiver first opens.
+        if(!seenInitial) { renderMessage(data, false); return; }
+        renderMessage(data, true);
+      }, err => status("receiverStatus", "Database error: " + err.message));
+      // Mark initial history as loaded shortly after the initial query events.
+      setTimeout(()=>{seenInitial=true; status("receiverStatus","Listening for new messages.");}, 1200);
+      loadVoices();
+      status("receiverStatus","Connecting to room…");
+    }
+  } catch(err){ status("setupStatus", "Couldn't connect: " + err.message + "\nCheck Firebase config, Anonymous Authentication, Realtime Database, and rules."); }
+});
+$("senderDisconnect").addEventListener("click", disconnect);
+$("receiverDisconnect").addEventListener("click", disconnect);
+$("send").addEventListener("click", async () => {
+  if(!connected || currentMode!=="sender") return;
+  const text=clean($("messageText").value);
+  if(!text){status("senderStatus","Type a message first.");return;}
+  if(text.length>280){status("senderStatus","Message is too long.");return;}
+  if(Date.now()-lastSendAt<5000){status("senderStatus","Please wait a few seconds before sending again.");return;}
+  try {
+    lastSendAt=Date.now();
+    await push(roomRef, { text, name: clean($("displayName").value).slice(0,24)||"Viewer", createdAt: serverTimestamp() });
+    $("messageText").value=""; $("charCount").textContent="0 / 280";
+    status("senderStatus","Sent! You can send another message in a few seconds.");
+  } catch(err){status("senderStatus","Send failed: "+err.message);}
+});
+function renderMessage(data, shouldSpeak){
+  const el=document.createElement("div"); el.className="message";
+  const name=document.createElement("span"); name.className="name"; name.textContent=(clean(String(data.name||"Viewer")).slice(0,24)||"Viewer")+": ";
+  const body=document.createElement("span"); body.textContent=clean(String(data.text||"")).slice(0,280);
+  el.append(name,body); $("messages").prepend(el);
+  while($("messages").children.length>30) $("messages").lastElementChild.remove();
+  if(shouldSpeak && currentMode==="receiver"){ queue.push({name:name.textContent.replace(/: $/,""),text:body.textContent}); processQueue(); }
+}
+function loadVoices(){
+  if(!("speechSynthesis" in window)) return;
+  const fill=()=>{const sel=$("voiceSelect"); const old=sel.value; sel.innerHTML='<option value="">Default browser voice</option>';
+    speechSynthesis.getVoices().forEach((v,i)=>{const opt=document.createElement("option");opt.value=String(i);opt.textContent=`${v.name} (${v.lang})`;sel.append(opt);}); sel.value=old;};
+  fill(); speechSynthesis.onvoiceschanged=fill;
+}
+function processQueue(){
+  if(speaking || muted || !queue.length || !connected) return;
+  const item=queue.shift();
+  if(queue.length>=Number($("maxQueue").value)) queue=queue.slice(-Number($("maxQueue").value));
+  speaking=true;
+  const utter=new SpeechSynthesisUtterance(`${item.name} says: ${item.text}`);
+  const voices=speechSynthesis.getVoices(), idx=$("voiceSelect").value;
+  if(idx!=="" && voices[Number(idx)]) utter.voice=voices[Number(idx)];
+  utter.rate=Number($("rate").value);
+  utter.onend=utter.onerror=()=>{speaking=false;processQueue();};
+  speechSynthesis.speak(utter);
+  status("receiverStatus", `Speaking; ${queue.length} message(s) queued.`);
+}
+$("enableVoice").addEventListener("click",()=>{
+  if(!("speechSynthesis" in window)){status("receiverStatus","This browser doesn't support built-in speech synthesis.");return;}
+  muted=false; speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance("Text to speech is enabled.");
+  const voices=speechSynthesis.getVoices(), idx=$("voiceSelect").value;
+  if(idx!=="" && voices[Number(idx)]) u.voice=voices[Number(idx)];
+  u.rate=Number($("rate").value); speechSynthesis.speak(u);
+  status("receiverStatus","Voice test sent. Keep this tab open and make sure its audio is captured by Lightstream.");
+});
+$("pauseSpeech").addEventListener("click",()=>speechSynthesis.pause());
+$("resumeSpeech").addEventListener("click",()=>{speechSynthesis.resume();processQueue();});
+$("clearQueue").addEventListener("click",()=>{queue=[];speechSynthesis.cancel();speaking=false;status("receiverStatus","Speech stopped and queue cleared.");});
+$("toggleMute").addEventListener("click",()=>{muted=!muted;$("toggleMute").textContent=muted?"Unmute TTS":"Mute TTS";if(muted)speechSynthesis.cancel();else processQueue();});
+</script>
+</body>
+</html>
